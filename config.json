@@ -1,0 +1,4 @@
+{
+	"managerPath": "/home/bergius/redis-landlord/manage.sh",
+	"listenPort": 8080
+}
