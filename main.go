@@ -9,8 +9,9 @@ import (
 	"os/exec"
 	"encoding/json"
 	"io/ioutil"
-	"net/http"
+	// "net/http"
 	"github.com/garyburd/redigo/redis"
+        "sync"
 )
 
 type Cfg struct {
@@ -71,39 +72,44 @@ func setup(id string) (int, error) {
 	return port, nil
 }
 
-func setupHandler(w http.ResponseWriter, r *http.Request, id string) {
-	log.Printf("Setup request for %s", id)
+func listen() error {
+  c, e := redis.Dial("tcp", ":6380")
+  if e != nil {
+    log.Printf("Unable to dial; %v", e)
+    return e
+  }
+  defer c.Close()
+  var wg sync.WaitGroup
+  wg.Add(1)
 
-	port, e := setup(id)
-	if e != nil {
-		http.Error(w, fmt.Sprintf("%v", e), 500)
-	}
+  psc := redis.PubSubConn{c}
 
-	fmt.Fprintf(w, "%d", port)
+  go func() {
+    //psc.Subscribe("setup")
+    defer wg.Done()
+    for {
+      switch v := psc.Receive().(type) {
+      case redis.Message:
+        log.Printf("%s: message %s\n", v.Channel, v.Data)
+      case redis.PMessage:
+        log.Printf("PMessage: %s %s %s\n", v.Pattern, v.Channel, v.Data)
+      case redis.Subscription:
+        log.Printf("%s: %s %d\n", v.Channel, v.Kind, v.Count)
+      case error:
+        log.Printf("Receive fail; %v", e)
+        return
+      }
+    }
+  }()
+
+  wg.Wait()
+  return nil
 }
 
 var idValidator = regexp.MustCompile("^[_\\-a-zA-Z0-9]+$")
 
-func makeHandler(prefix string, fn func(http.ResponseWriter, *http.Request, string)) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		id := r.URL.Path[len(prefix):]
-		if !idValidator.MatchString(id) {
-			http.Error(w, "Invalid id.", 500)
-			return
-		}
-
-		fn(w, r, id)
-	}
-}
-
 func main() {
-	cfg = readConfig()
-	http.HandleFunc("/setup/", makeHandler("/setup/", setupHandler))
-
-	log.Printf("Listening on port %d\n", cfg.ListenPort)
-	if e := http.ListenAndServe(fmt.Sprintf(":%d", cfg.ListenPort), nil); e != nil {
-		log.Fatal(e)
-	}
+        listen()
 
 	log.Println("Exited")
 	fmt.Println("Good bye.")
