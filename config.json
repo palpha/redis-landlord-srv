@@ -1,4 +1,4 @@
 {
-	"managerPath": "/home/bergius/redis-landlord/manage.sh",
+	"managerPath": "/home/niklas/redis-landlord/manage.sh",
 	"listenPort": 8080
 }
