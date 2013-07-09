@@ -298,7 +298,7 @@ func listen() {
 	return
 }
 
-var idValidator = regexp.MustCompile("^[_\\-a-zA-Z0-9]+$")
+var idValidator = regexp.MustCompile(`^[_\-a-zA-Z0-9]+$`)
 
 func prepareDb() {
 	c := dial()
