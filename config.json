@@ -1,4 +1,5 @@
 {
 	"managerPath": "/home/niklas/redis-landlord/manage.sh",
-	"listenPort": 8080
+	"listenPort": 8080,
+  "logPath": "/home/niklas/gosrc/src/bergius.org/redis-landlord-srv/srv.log"
 }

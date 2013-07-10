@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bitbucket.org/kardianos/osext"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/garyburd/redigo/redis"
+	"io"
 	"io/ioutil"
 	"log"
+	"os"
 	"os/exec"
 	"path"
 	"regexp"
@@ -21,12 +24,28 @@ type Cfg struct {
 	LandlordPort   int
 	TenantPortBase int
 	MaxTenants     int
+	LogPath        string
+}
+
+type ManagerError struct {
+	ExitCode int
+	Message  string
+}
+
+func (e *ManagerError) Error() string {
+	return (*e).Message
 }
 
 type Instruction struct {
 	ReplyTo string
 	Op      string
 	Id      string
+}
+
+type PlainResponse struct {
+	Id     string
+	Status string
+	Error  string
 }
 
 type SetupResponse struct {
@@ -37,8 +56,22 @@ type SetupResponse struct {
 }
 
 var cfg Cfg
+var idRe = regexp.MustCompile(`^[_\-a-zA-Z0-9]+$`)
+var errRe = regexp.MustCompile(`^exit status ([0-9]+)$`)
+var managerErrors = map[int]string{
+	1: "Invalid command.",
+	2: "Invalid instance id.",
+	3: "Invalid port.",
+	4: "Sudo required.",
+	5: "Already installed",
+	6: "Landlord not installed correctly.",
+	7: "Instance already exists.",
+	8: "Instance not enabled."}
 
 func readConfig() *Cfg {
+	// note: log will not be configured to write to file yet,
+	// so who knows who'll see the log output at this stage...
+
 	file, e := ioutil.ReadFile("./config.json")
 	if e != nil {
 		log.Fatalf("Unable to read config.json: %s", e)
@@ -67,7 +100,17 @@ func readConfig() *Cfg {
 		cfg.MaxTenants = 10
 	}
 
-	log.Printf("Config: %v", cfg)
+	if cfg.LogPath == "" {
+		cfg.LogPath =
+			func() string {
+				f, e := osext.ExecutableFolder()
+				if e != nil {
+					log.Fatal("Unable to read executable path, add LogPath to config.json.", e)
+				}
+
+				return f + "srv.log"
+			}()
+	}
 
 	return &cfg
 }
@@ -124,7 +167,11 @@ func getFreePort(c *redis.Conn) int {
 		redis.call("ZINTERSTORE", KEYS[3], 1, KEYS[3])
 		local freePort = redis.call("ZRANGE", KEYS[3], 0, 0)[1]
 		redis.call("SADD", KEYS[2], freePort)
-		return freePort
+		if freePort == nil then
+			return 0
+		else
+			return freePort
+		end
 	`)
 
 	r, e := redis.Int(s.Do(*c,
@@ -149,23 +196,6 @@ func releasePort(c *redis.Conn, port int) {
 	}
 }
 
-func persistPort(c *redis.Conn, id string, port int) {
-	log.Printf("Persisting port %d for %s", port, id)
-	f := func() error {
-		if _, e := (*c).Do("SET", getKey("tenant", id, "port"), port); e != nil {
-			return e
-		}
-		if _, e := (*c).Do("SADD", getKey("tenants"), id); e != nil {
-			return e
-		}
-		return nil
-	}
-
-	if e := f(); e != nil {
-		log.Panicf("Unable to persist port %d for %s: %v", port, id, e)
-	}
-}
-
 func getPort(c *redis.Conn, id string) int {
 	log.Printf("Getting port for %s", id)
 	r, e := redis.Int((*c).Do("GET", getKey("tenant", id, "port")))
@@ -176,7 +206,48 @@ func getPort(c *redis.Conn, id string) int {
 	return r
 }
 
-func setup(id string) (rport int, err error) {
+func executeManagerOp(op string, id string, args ...string) (string, error) {
+	allArgs := make([]string, 0, len(args)+3)
+	allArgs = append(allArgs, cfg.ManagerPath, op, id)
+	allArgs = append(allArgs, args...)
+
+	log.Printf("Running sudo %s", strings.Join(allArgs, " "))
+
+	cmd := exec.Command("sudo", allArgs...)
+	cmd.Dir = path.Dir(cfg.ManagerPath)
+	output, e := cmd.CombinedOutput()
+	if e != nil {
+		log.Printf("Unable to run %s: %v", strings.Join(allArgs, " "), e)
+	}
+
+	log.Println(string(output))
+
+	return string(output), e
+}
+
+func parseManagerError(err string) ManagerError {
+	idMatch := errRe.FindStringSubmatch(err)
+	errf := func(id int, msg string) ManagerError {
+		return ManagerError{ExitCode: id, Message: msg}
+	}
+
+	if idMatch == nil {
+		return errf(0, fmt.Sprintf("Unknown error (%s).", err))
+	}
+
+	id, e := strconv.Atoi(idMatch[1])
+	if e != nil {
+		return errf(0, fmt.Sprintf("Invalid exit status (%s)", idMatch[1]))
+	}
+
+	if msg, ok := managerErrors[id]; ok {
+		return errf(id, msg)
+	} else {
+		return errf(id, fmt.Sprintf("Unknown exit status (%d)", id))
+	}
+}
+
+func setupInstance(id string) (rport int, err error) {
 	c := dial()
 	defer (*c).Close()
 
@@ -200,27 +271,38 @@ func setup(id string) (rport int, err error) {
 	}()
 
 	port = getFreePort(c)
+	if _, e := executeManagerOp("setup", id, strconv.Itoa(port)); e != nil {
+		err := parseManagerError(e.Error())
+		log.Printf("parsed: %v", err)
+		if err.ExitCode != 7 {
+			if port == 0 {
+				panic(errors.New("No free ports. Increase MaxTenants, or set up a new Landlord server."))
+			}
 
-	log.Printf("Running sudo %s setup %s %i", cfg.ManagerPath, id, port)
-	cmd := exec.Command("sudo", cfg.ManagerPath, "setup", id, strconv.Itoa(port))
-	cmd.Dir = path.Dir(cfg.ManagerPath)
-	output, e := cmd.CombinedOutput()
-	if e != nil {
-		log.Printf("Unable to run %s setup %s %d: %v", cfg.ManagerPath, id, port, e)
-		log.Println(string(output))
-
-		if e.Error() != "exit status 7" {
-			panic(e)
+			panic(err)
 		}
 
 		releasePort(c, port)
 		port = getPort(c, id)
 	}
 
-	log.Println(string(output))
-	persistPort(c, id, port)
-
 	return port, nil
+}
+
+func deleteInstance(id string) error {
+	c := dial()
+	defer (*c).Close()
+
+	if _, e := executeManagerOp("delete", id); e != nil {
+		switch e.Error() {
+		case "exit status 9":
+			return errors.New("Instance does not exist.")
+		}
+
+		return e
+	}
+
+	return nil
 }
 
 func dispatchResponse(recipient string, rsp interface{}) {
@@ -246,25 +328,54 @@ func handleInstruction(instr *Instruction) {
 	defer func() {
 		if e := recover(); e != nil {
 			log.Printf("Panic stopped: %v", e)
+			var msg string
+			switch v := e.(type) {
+			case error:
+				msg = v.Error()
+			case string:
+				msg = v
+			default:
+				msg = fmt.Sprintf("%v", v)
+			}
+
+			dispatchResponse(instr.ReplyTo, &PlainResponse{Status: "ERROR", Error: msg})
 		}
 	}()
 
+	if idRe.MatchString(instr.Id) == false {
+		log.Panicf("Invalid id.")
+	}
+
 	switch instr.Op {
 	case "Setup":
-		rsp := new(SetupResponse)
+		rsp := &SetupResponse{Status: "OK"}
 		rsp.Id = instr.Id
-		port, e := setup(instr.Id)
+		port, e := setupInstance(instr.Id)
 		if e != nil {
 			rsp.Status = "ERROR"
 			rsp.Error = e.Error()
 		} else {
-			rsp.Status = "OK"
 			rsp.Port = port
 		}
 
 		dispatchResponse(instr.ReplyTo, rsp)
+
+	case "Delete":
+		rsp := &PlainResponse{Status: "OK"}
+		rsp.Id = instr.Id
+		if e := deleteInstance(instr.Id); e != nil {
+			rsp.Status = "ERROR"
+			rsp.Error = e.Error()
+		}
+
+		dispatchResponse(instr.ReplyTo, rsp)
+
 	default:
 		log.Printf("Unknown op: %s", instr.Op)
+
+		rsp := &PlainResponse{Status: "ERROR", Error: "Unknown operation."}
+		dispatchResponse(instr.ReplyTo, rsp)
+
 	}
 }
 
@@ -287,6 +398,11 @@ func listen() {
 				if instr := readInstruction(&v); instr != nil {
 					handleInstruction(instr)
 				}
+
+				// If we can't read the instruction, we don't know to whom we
+				// should respond. This is a slight problem, which could be solved
+				// by using a pattern subscription and embedding the ReplyTo in
+				// the channel name.
 			case error:
 				log.Printf("Receive fail; %v", v)
 				return
@@ -297,8 +413,6 @@ func listen() {
 	wg.Wait()
 	return
 }
-
-var idValidator = regexp.MustCompile(`^[_\-a-zA-Z0-9]+$`)
 
 func prepareDb() {
 	c := dial()
@@ -323,8 +437,20 @@ func prepareDb() {
 	refreshOccupiedPorts(c)
 }
 
+func initLogging() {
+	fmt.Printf("Creating file %s", cfg.LogPath)
+	logf, e := os.OpenFile(cfg.LogPath, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0666)
+	if e != nil {
+		panic(errors.New(fmt.Sprintf("Unable to open log file %s: %v", cfg.LogPath, e)))
+	}
+
+	log.SetOutput(io.MultiWriter(logf, os.Stdout))
+}
+
 func main() {
 	cfg = *readConfig()
+	initLogging()
+	log.Printf("Config: %v", cfg)
 	prepareDb()
 	listen()
 
