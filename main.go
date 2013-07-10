@@ -160,7 +160,7 @@ func refreshOccupiedPorts(c *redis.Conn) {
 }
 
 func getFreePort(c *redis.Conn) int {
-	refreshOccupiedPorts(c)
+	// refreshOccupiedPorts(c)
 
 	s := redis.NewScript(3, `
 		redis.call("SDIFFSTORE", KEYS[3], KEYS[1], KEYS[2])
@@ -396,7 +396,7 @@ func listen() {
 			case redis.Message:
 				log.Printf("%s: message %s", v.Channel, v.Data)
 				if instr := readInstruction(&v); instr != nil {
-					handleInstruction(instr)
+					go handleInstruction(instr)
 				}
 
 				// If we can't read the instruction, we don't know to whom we
