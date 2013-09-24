@@ -305,6 +305,32 @@ func deleteInstance(id string) error {
 	return nil
 }
 
+func getExistingPort(id string) (rport int, err error) {
+	c := dial()
+	defer (*c).Close()
+
+	var port int
+
+	defer func() {
+		if e := recover(); e != nil {
+			rport = 0
+			switch v := e.(type) {
+			case error:
+				err = v
+			case string:
+				err = errors.New(v)
+			default:
+				err = fmt.Errorf("%s", v)
+			}
+		}
+	}()
+
+	log.Printf("Getting port for \"%s\"", id)
+
+	port = getPort(c, id)
+	return port, nil
+}
+
 func dispatchResponse(recipient string, rsp interface{}) {
 	c := *dial()
 	defer c.Close()
@@ -346,6 +372,8 @@ func handleInstruction(instr *Instruction) {
 		log.Panicf("Invalid id.")
 	}
 
+	log.Printf("Op: %s", instr.Op)
+
 	switch instr.Op {
 	case "Setup":
 		rsp := &SetupResponse{Status: "OK"}
@@ -366,6 +394,19 @@ func handleInstruction(instr *Instruction) {
 		if e := deleteInstance(instr.Id); e != nil {
 			rsp.Status = "ERROR"
 			rsp.Error = e.Error()
+		}
+
+		dispatchResponse(instr.ReplyTo, rsp)
+
+	case "GetPort":
+		rsp := &SetupResponse{Status: "OK"}
+		rsp.Id = instr.Id
+		port, e := getExistingPort(instr.Id)
+		if e != nil {
+			rsp.Status = "ERROR"
+			rsp.Error = e.Error()
+		} else {
+			rsp.Port = port
 		}
 
 		dispatchResponse(instr.ReplyTo, rsp)
